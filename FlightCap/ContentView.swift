@@ -8,17 +8,27 @@
 import SwiftUI
 
 struct ContentView: View {
+    @EnvironmentObject var ble: BLEManager
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        ZStack {
+            Theme.background.ignoresSafeArea()
+
+            Group {
+                switch ble.state {
+                case .connected:
+                    ConnectedView()
+                default:
+                    ScanView()
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: ble.state)
         }
-        .padding()
     }
 }
 
 #Preview {
     ContentView()
+        .environmentObject(BLEManager())
+        .preferredColorScheme(.dark)
 }
