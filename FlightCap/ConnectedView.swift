@@ -28,10 +28,34 @@ struct ConnectedView: View {
                 samples: ble.distanceSamples,
                 yLabel: "mm"
             )
+
+            clearButton
         }
         .padding(.horizontal, 16)
         .padding(.top, 12)
         .padding(.bottom, 16)
+    }
+
+    private var clearButton: some View {
+        Button(action: { ble.clearPlots() }) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 16, weight: .bold))
+                Text("Clear Plots")
+                    .font(.system(size: 16, weight: .heavy, design: .rounded))
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(
+                Capsule().fill(Color.white.opacity(0.12))
+            )
+            .overlay(
+                Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 4)
     }
 
     private var header: some View {
@@ -44,6 +68,24 @@ struct ConnectedView: View {
                 .font(.system(size: 16, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white)
             Spacer()
+            Button(action: { ble.disconnect() }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14, weight: .bold))
+                    Text("Disconnect")
+                        .font(.system(size: 14, weight: .heavy, design: .rounded))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule().fill(Color.red.opacity(0.85))
+                )
+                .overlay(
+                    Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 4)
     }
@@ -58,8 +100,7 @@ struct ConnectedView: View {
     private var distanceSubtitle: String {
         guard let last = ble.distanceSamples.last else { return "---" }
         if last.value.isNaN { return "invalid" }
-        let meters = last.value / 1000.0
-        return String(format: "%.2f m", meters)
+        return "\(Int(last.value)) mm"
     }
 }
 

@@ -91,6 +91,24 @@ final class BLEManager: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.scanTimeout, execute: work)
     }
 
+    /// Wipe both rolling buffers and reset their monotonic indices so the
+    /// next 100 samples fill left-to-right again.
+    func clearPlots() {
+        resetBuffers()
+    }
+
+    /// User-initiated disconnect. The actual teardown (and return to
+    /// ScanView via `state = .idle`) happens in `didDisconnectPeripheral`.
+    func disconnect() {
+        cancelScanTimeout()
+        if central.isScanning { central.stopScan() }
+        if let peripheral {
+            central.cancelPeripheralConnection(peripheral)
+        } else {
+            teardownConnection()
+        }
+    }
+
     // MARK: - Helpers
 
     private func resetBuffers() {
@@ -257,6 +275,7 @@ extension BLEManager: CBPeripheralDelegate {
 
         switch characteristic.uuid {
         case Self.motionUUID:
+            Self.logPayload(tag: "MOTION", data: data)
             guard data.count >= 4 else { return }
             let motion = data.withUnsafeBytes { raw -> UInt32 in
                 raw.loadUnaligned(as: UInt32.self)
@@ -266,6 +285,7 @@ extension BLEManager: CBPeripheralDelegate {
             }
 
         case Self.distanceUUID:
+            Self.logPayload(tag: "DIST  ", data: data)
             guard data.count >= 4 else { return }
             let mm    = UInt16(data[0]) | (UInt16(data[1]) << 8)
             let count = UInt16(data[2]) | (UInt16(data[3]) << 8)
@@ -278,5 +298,29 @@ extension BLEManager: CBPeripheralDelegate {
         default:
             break
         }
+    }
+
+    /// Emits raw bytes plus every plausible little-endian decoding of the
+    /// first four bytes so we can diagnose unexpected payload layouts.
+    /// Output goes to the Xcode debug console / `stderr`.
+    nonisolated private static func logPayload(tag: String, data: Data) {
+        let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
+        let dec = data.map { String($0) }.joined(separator: " ")
+        var detail = ""
+        if data.count >= 4 {
+            detail = data.withUnsafeBytes { raw -> String in
+                let u16_01 = raw.loadUnaligned(fromByteOffset: 0, as: UInt16.self).littleEndian
+                let u16_23 = raw.loadUnaligned(fromByteOffset: 2, as: UInt16.self).littleEndian
+                let u32    = raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian
+                let i16_01 = Int16(bitPattern: u16_01)
+                let i16_23 = Int16(bitPattern: u16_23)
+                return String(
+                    format: " | u16[0..1]=%u (i16=%d) u16[2..3]=%u (i16=%d) u32=%u",
+                    u16_01, Int(i16_01), u16_23, Int(i16_23), u32
+                )
+            }
+        }
+        let ts = String(format: "%.3f", Date().timeIntervalSince1970)
+        print("[\(ts)] [\(tag)] len=\(data.count) hex=[\(hex)] u8=[\(dec)]\(detail)")
     }
 }
