@@ -8,57 +8,55 @@ import CoreBluetooth
 import Combine
 
 /// One point in a rolling time-series buffer.
-/// `value == .nan` is used to signal an invalid sample so Swift Charts renders a gap.
+/// `value == .nan` signals an invalid sample (omitted from the chart).
 struct Sample: Identifiable, Equatable {
-    let id: Int
+    let id = UUID()
+    let timestamp: Date
     let value: Double
 }
 
-enum ConnectionState: Equatable {
+enum AppState: Equatable {
     case idle
     case scanning
-    case connecting
-    case connected
+    case listening
+}
+
+struct DiscoveredCap: Identifiable, Equatable {
+    let id: Data
+    var displayName: String
+    var rssi: Int
+    var lastSeen: Date
+    var isPairMode: Bool
+    var lastSeq: UInt16?
 }
 
 @MainActor
 final class BLEManager: NSObject, ObservableObject {
 
-    // MARK: - GATT contract (FlightCap_BLE_Spec.md, Phase 1)
+    /// Rolling plot window — only samples within the last 5 minutes are kept.
+    static let plotWindow: TimeInterval = 5 * 60
+    static let scanTimeout: TimeInterval = 60
 
-    static let serviceUUID  = CBUUID(string: "AD2A98A4-2148-4B58-9E14-7E2CBB6C7B01")
-    static let motionUUID   = CBUUID(string: "AD2A98A4-2148-4B58-9E14-7E2CBB6C7B02")
-    static let distanceUUID = CBUUID(string: "AD2A98A4-2148-4B58-9E14-7E2CBB6C7B03")
-
-    /// Sliding-window length for both plots.
-    static let windowSize = 100
-
-    /// Scan timeout before giving up and returning to idle.
-    static let scanTimeout: TimeInterval = 10
+    private static let scanOptions: [String: Any] = [
+        CBCentralManagerScanOptionAllowDuplicatesKey: true
+    ]
 
     // MARK: - Published state
 
-    @Published private(set) var state: ConnectionState = .idle
+    @Published private(set) var state: AppState = .idle
+    @Published private(set) var discoveredCaps: [DiscoveredCap] = []
+    @Published private(set) var selectedCap: DiscoveredCap?
     @Published private(set) var motionSamples: [Sample] = []
     @Published private(set) var distanceSamples: [Sample] = []
+    @Published private(set) var latestVbattMv: UInt16?
+    @Published private(set) var latestVbattValid = false
+    @Published private(set) var lastDataReceived: Date?
     @Published var lastMessage: String?
-
-    /// Latest decoded distance sample_count, exposed so the UI can label invalid windows.
-    @Published private(set) var latestDistanceSampleCount: UInt16 = 0
 
     // MARK: - Private
 
     private var central: CBCentralManager!
-    private var peripheral: CBPeripheral?
-    private var motionCharacteristic: CBCharacteristic?
-    private var distanceCharacteristic: CBCharacteristic?
-
-    private var motionIndex = 0
-    private var distanceIndex = 0
-
-    private var motionSubscribed = false
-    private var distanceSubscribed = false
-
+    private var lastRecordedSeq: UInt16?
     private var scanTimeoutWork: DispatchWorkItem?
 
     override init() {
@@ -68,9 +66,9 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - Public API
 
-    func startScan() {
+    func startDiscoveryScan() {
         lastMessage = nil
-        resetBuffers()
+        discoveredCaps.removeAll(keepingCapacity: true)
 
         guard central.state == .poweredOn else {
             lastMessage = bluetoothStateMessage(for: central.state)
@@ -78,35 +76,45 @@ final class BLEManager: NSObject, ObservableObject {
         }
 
         state = .scanning
-        central.scanForPeripherals(withServices: [Self.serviceUUID])
-
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            guard self.state == .scanning else { return }
-            self.central.stopScan()
-            self.state = .idle
-            self.lastMessage = "No FlightCap found"
-        }
-        scanTimeoutWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.scanTimeout, execute: work)
+        central.scanForPeripherals(withServices: nil, options: Self.scanOptions)
+        scheduleScanTimeout(message: "Scan timed out after 60 s")
     }
 
-    /// Wipe both rolling buffers and reset their monotonic indices so the
-    /// next 100 samples fill left-to-right again.
-    func clearPlots() {
-        resetBuffers()
-    }
-
-    /// User-initiated disconnect. The actual teardown (and return to
-    /// ScanView via `state = .idle`) happens in `didDisconnectPeripheral`.
-    func disconnect() {
+    func stopScan() {
         cancelScanTimeout()
         if central.isScanning { central.stopScan() }
-        if let peripheral {
-            central.cancelPeripheralConnection(peripheral)
-        } else {
-            teardownConnection()
+        if state == .scanning { state = .idle }
+    }
+
+    func selectCap(_ cap: DiscoveredCap) {
+        cancelScanTimeout()
+        if central.isScanning { central.stopScan() }
+
+        selectedCap = cap
+        resetBuffers()
+        lastDataReceived = nil
+        state = .listening
+        lastMessage = nil
+
+        guard central.state == .poweredOn else {
+            lastMessage = bluetoothStateMessage(for: central.state)
+            return
         }
+
+        central.scanForPeripherals(withServices: nil, options: Self.scanOptions)
+    }
+
+    func leaveListening() {
+        cancelScanTimeout()
+        if central.isScanning { central.stopScan() }
+        selectedCap = nil
+        lastRecordedSeq = nil
+        lastDataReceived = nil
+        state = .idle
+    }
+
+    func clearPlots() {
+        resetBuffers()
     }
 
     // MARK: - Helpers
@@ -114,9 +122,22 @@ final class BLEManager: NSObject, ObservableObject {
     private func resetBuffers() {
         motionSamples.removeAll(keepingCapacity: true)
         distanceSamples.removeAll(keepingCapacity: true)
-        motionIndex = 0
-        distanceIndex = 0
-        latestDistanceSampleCount = 0
+        lastRecordedSeq = nil
+        latestVbattMv = nil
+        latestVbattValid = false
+    }
+
+    private func scheduleScanTimeout(message: String) {
+        cancelScanTimeout()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.state == .scanning else { return }
+            self.central.stopScan()
+            self.state = .idle
+            self.lastMessage = message
+        }
+        scanTimeoutWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.scanTimeout, execute: work)
     }
 
     private func cancelScanTimeout() {
@@ -124,33 +145,78 @@ final class BLEManager: NSObject, ObservableObject {
         scanTimeoutWork = nil
     }
 
-    private func teardownConnection(message: String? = nil) {
-        cancelScanTimeout()
-        if central.isScanning { central.stopScan() }
-        peripheral?.delegate = nil
-        peripheral = nil
-        motionCharacteristic = nil
-        distanceCharacteristic = nil
-        motionSubscribed = false
-        distanceSubscribed = false
-        state = .idle
-        if let message { lastMessage = message }
+    private func upsertDiscoveredCap(telemetry: FlightCapTelemetry, rssi: Int) {
+        let addr = telemetry.deviceAddr
+        let now = Date()
+
+        if let idx = discoveredCaps.firstIndex(where: { $0.id.elementsEqual(addr) }) {
+            discoveredCaps[idx].rssi = rssi
+            discoveredCaps[idx].lastSeen = now
+            discoveredCaps[idx].isPairMode = telemetry.isPairMode
+            discoveredCaps[idx].lastSeq = telemetry.seq
+        } else {
+            discoveredCaps.append(DiscoveredCap(
+                id: addr,
+                displayName: DeviceAddr.format(addr),
+                rssi: rssi,
+                lastSeen: now,
+                isPairMode: telemetry.isPairMode,
+                lastSeq: telemetry.seq
+            ))
+        }
+
+        discoveredCaps.sort { $0.lastSeen > $1.lastSeen }
     }
 
-    private func appendMotion(_ value: Double) {
-        motionSamples.append(Sample(id: motionIndex, value: value))
-        motionIndex += 1
-        if motionSamples.count > Self.windowSize {
-            motionSamples.removeFirst(motionSamples.count - Self.windowSize)
+    private func handleListeningTelemetry(_ telemetry: FlightCapTelemetry) {
+        guard let selected = selectedCap else { return }
+        guard telemetry.deviceAddr.elementsEqual(selected.id) else { return }
+
+        lastDataReceived = Date()
+        pruneAllSamples()
+
+        if let lastSeq = lastRecordedSeq, lastSeq == telemetry.seq { return }
+        lastRecordedSeq = telemetry.seq
+
+        let motionValue: Double = telemetry.isInteractValid
+            ? Double(telemetry.interactions)
+            : .nan
+        let distanceValue: Double = telemetry.isDistValid
+            ? Double(telemetry.distanceMm)
+            : .nan
+
+        let recordedAt = Date()
+        appendMotion(motionValue, at: recordedAt)
+        appendDistance(distanceValue, at: recordedAt)
+
+        latestVbattValid = telemetry.isVbattValid
+        latestVbattMv = telemetry.isVbattValid ? telemetry.vbattMv : nil
+    }
+
+    private func appendMotion(_ value: Double, at timestamp: Date) {
+        motionSamples.append(Sample(timestamp: timestamp, value: value))
+        pruneSamples(&motionSamples)
+    }
+
+    private func appendDistance(_ value: Double, at timestamp: Date) {
+        distanceSamples.append(Sample(timestamp: timestamp, value: value))
+        pruneSamples(&distanceSamples)
+    }
+
+    private func pruneSamples(_ samples: inout [Sample]) {
+        let cutoff = Date().addingTimeInterval(-Self.plotWindow)
+        if let firstKeep = samples.firstIndex(where: { $0.timestamp >= cutoff }) {
+            if firstKeep > 0 {
+                samples.removeFirst(firstKeep)
+            }
+        } else {
+            samples.removeAll(keepingCapacity: true)
         }
     }
 
-    private func appendDistance(_ value: Double) {
-        distanceSamples.append(Sample(id: distanceIndex, value: value))
-        distanceIndex += 1
-        if distanceSamples.count > Self.windowSize {
-            distanceSamples.removeFirst(distanceSamples.count - Self.windowSize)
-        }
+    private func pruneAllSamples() {
+        pruneSamples(&motionSamples)
+        pruneSamples(&distanceSamples)
     }
 
     private func bluetoothStateMessage(for state: CBManagerState) -> String? {
@@ -173,7 +239,13 @@ extension BLEManager: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
             if central.state != .poweredOn, self.state != .idle {
-                self.teardownConnection(message: self.bluetoothStateMessage(for: central.state))
+                self.cancelScanTimeout()
+                if central.isScanning { central.stopScan() }
+                self.selectedCap = nil
+                self.lastRecordedSeq = nil
+                self.lastDataReceived = nil
+                self.state = .idle
+                self.lastMessage = self.bluetoothStateMessage(for: central.state)
             } else if central.state != .poweredOn {
                 self.lastMessage = self.bluetoothStateMessage(for: central.state)
             }
@@ -184,143 +256,22 @@ extension BLEManager: CBCentralManagerDelegate {
                                     didDiscover peripheral: CBPeripheral,
                                     advertisementData: [String: Any],
                                     rssi RSSI: NSNumber) {
+        guard let mfg = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+              let telemetry = FlightCapTelemetryParser.parse(manufacturerData: mfg) else {
+            return
+        }
+
+        let rssi = RSSI.intValue
+
         Task { @MainActor in
-            guard self.state == .scanning else { return }
-            self.cancelScanTimeout()
-            central.stopScan()
-            self.peripheral = peripheral
-            peripheral.delegate = self
-            self.state = .connecting
-            central.connect(peripheral, options: nil)
-        }
-    }
-
-    nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        Task { @MainActor in
-            peripheral.discoverServices([Self.serviceUUID])
-        }
-    }
-
-    nonisolated func centralManager(_ central: CBCentralManager,
-                                    didFailToConnect peripheral: CBPeripheral,
-                                    error: Error?) {
-        Task { @MainActor in
-            self.teardownConnection(message: "Failed to connect")
-        }
-    }
-
-    nonisolated func centralManager(_ central: CBCentralManager,
-                                    didDisconnectPeripheral peripheral: CBPeripheral,
-                                    error: Error?) {
-        Task { @MainActor in
-            let msg: String? = (self.state == .connected) ? "Disconnected" : nil
-            self.teardownConnection(message: msg)
-        }
-    }
-}
-
-// MARK: - CBPeripheralDelegate
-
-extension BLEManager: CBPeripheralDelegate {
-
-    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        Task { @MainActor in
-            guard let service = peripheral.services?.first(where: { $0.uuid == Self.serviceUUID }) else {
-                self.teardownConnection(message: "FlightCap service not found")
-                return
-            }
-            peripheral.discoverCharacteristics([Self.motionUUID, Self.distanceUUID], for: service)
-        }
-    }
-
-    nonisolated func peripheral(_ peripheral: CBPeripheral,
-                                didDiscoverCharacteristicsFor service: CBService,
-                                error: Error?) {
-        Task { @MainActor in
-            for chr in service.characteristics ?? [] {
-                switch chr.uuid {
-                case Self.motionUUID:
-                    self.motionCharacteristic = chr
-                    peripheral.setNotifyValue(true, for: chr)
-                case Self.distanceUUID:
-                    self.distanceCharacteristic = chr
-                    peripheral.setNotifyValue(true, for: chr)
-                default:
-                    break
-                }
+            switch self.state {
+            case .scanning:
+                self.upsertDiscoveredCap(telemetry: telemetry, rssi: rssi)
+            case .listening:
+                self.handleListeningTelemetry(telemetry)
+            case .idle:
+                break
             }
         }
-    }
-
-    nonisolated func peripheral(_ peripheral: CBPeripheral,
-                                didUpdateNotificationStateFor characteristic: CBCharacteristic,
-                                error: Error?) {
-        Task { @MainActor in
-            if characteristic.uuid == Self.motionUUID, characteristic.isNotifying {
-                self.motionSubscribed = true
-            }
-            if characteristic.uuid == Self.distanceUUID, characteristic.isNotifying {
-                self.distanceSubscribed = true
-            }
-            if self.motionSubscribed, self.distanceSubscribed, self.state == .connecting {
-                self.state = .connected
-            }
-        }
-    }
-
-    nonisolated func peripheral(_ peripheral: CBPeripheral,
-                                didUpdateValueFor characteristic: CBCharacteristic,
-                                error: Error?) {
-        guard let data = characteristic.value else { return }
-
-        switch characteristic.uuid {
-        case Self.motionUUID:
-            Self.logPayload(tag: "MOTION", data: data)
-            guard data.count >= 4 else { return }
-            let motion = data.withUnsafeBytes { raw -> UInt32 in
-                raw.loadUnaligned(as: UInt32.self)
-            }.littleEndian
-            Task { @MainActor in
-                self.appendMotion(Double(motion))
-            }
-
-        case Self.distanceUUID:
-            Self.logPayload(tag: "DIST  ", data: data)
-            guard data.count >= 4 else { return }
-            let mm    = UInt16(data[0]) | (UInt16(data[1]) << 8)
-            let count = UInt16(data[2]) | (UInt16(data[3]) << 8)
-            let value: Double = count < 4 ? .nan : Double(mm)
-            Task { @MainActor in
-                self.latestDistanceSampleCount = count
-                self.appendDistance(value)
-            }
-
-        default:
-            break
-        }
-    }
-
-    /// Emits raw bytes plus every plausible little-endian decoding of the
-    /// first four bytes so we can diagnose unexpected payload layouts.
-    /// Output goes to the Xcode debug console / `stderr`.
-    nonisolated private static func logPayload(tag: String, data: Data) {
-        let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
-        let dec = data.map { String($0) }.joined(separator: " ")
-        var detail = ""
-        if data.count >= 4 {
-            detail = data.withUnsafeBytes { raw -> String in
-                let u16_01 = raw.loadUnaligned(fromByteOffset: 0, as: UInt16.self).littleEndian
-                let u16_23 = raw.loadUnaligned(fromByteOffset: 2, as: UInt16.self).littleEndian
-                let u32    = raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian
-                let i16_01 = Int16(bitPattern: u16_01)
-                let i16_23 = Int16(bitPattern: u16_23)
-                return String(
-                    format: " | u16[0..1]=%u (i16=%d) u16[2..3]=%u (i16=%d) u32=%u",
-                    u16_01, Int(i16_01), u16_23, Int(i16_23), u32
-                )
-            }
-        }
-        let ts = String(format: "%.3f", Date().timeIntervalSince1970)
-        print("[\(ts)] [\(tag)] len=\(data.count) hex=[\(hex)] u8=[\(dec)]\(detail)")
     }
 }

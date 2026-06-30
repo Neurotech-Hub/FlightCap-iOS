@@ -8,17 +8,20 @@ import Charts
 
 struct ConnectedView: View {
     @EnvironmentObject var ble: BLEManager
+    @State private var now = Date()
 
     var body: some View {
         VStack(spacing: 16) {
             header
+            batteryStrip
 
             TelemetryChart(
                 title: "Motion",
                 subtitle: motionSubtitle,
                 accent: Theme.motion,
                 samples: ble.motionSamples,
-                yLabel: "events / sec"
+                yLabel: "interactions",
+                now: now
             )
 
             TelemetryChart(
@@ -26,7 +29,8 @@ struct ConnectedView: View {
                 subtitle: distanceSubtitle,
                 accent: Theme.distance,
                 samples: ble.distanceSamples,
-                yLabel: "mm"
+                yLabel: "mm",
+                now: now
             )
 
             clearButton
@@ -34,6 +38,9 @@ struct ConnectedView: View {
         .padding(.horizontal, 16)
         .padding(.top, 12)
         .padding(.bottom, 16)
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { tick in
+            now = tick
+        }
     }
 
     private var clearButton: some View {
@@ -64,25 +71,30 @@ struct ConnectedView: View {
                 .fill(Color.green)
                 .frame(width: 10, height: 10)
                 .shadow(color: .green.opacity(0.8), radius: 6)
-            Text("Connected to FlightCap")
-                .font(.system(size: 16, weight: .semibold, design: .rounded))
+
+            Text(listeningTitle)
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+
             Spacer()
-            Button(action: { ble.disconnect() }) {
+
+            Button(action: { ble.leaveListening() }) {
                 HStack(spacing: 6) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14, weight: .bold))
-                    Text("Disconnect")
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 13, weight: .bold))
+                    Text("Back")
                         .font(.system(size: 14, weight: .heavy, design: .rounded))
                 }
                 .foregroundStyle(.white)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(
-                    Capsule().fill(Color.red.opacity(0.85))
+                    Capsule().fill(Color.white.opacity(0.12))
                 )
                 .overlay(
-                    Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
+                    Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1)
                 )
             }
             .buttonStyle(.plain)
@@ -90,17 +102,71 @@ struct ConnectedView: View {
         .padding(.horizontal, 4)
     }
 
+    private var batteryStrip: some View {
+        HStack(spacing: 16) {
+            HStack(spacing: 6) {
+                Image(systemName: "battery.100")
+                    .foregroundStyle(Theme.motion)
+                Text(batterySubtitle)
+                    .font(.system(size: 14, weight: .bold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(.white)
+            }
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                Image(systemName: "clock")
+                    .foregroundStyle(Theme.distance)
+                Text(lastDataSubtitle)
+                    .font(.system(size: 14, weight: .bold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(.white)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Theme.panel)
+        )
+        .padding(.horizontal, 4)
+    }
+
+    private var listeningTitle: String {
+        if let name = ble.selectedCap?.displayName {
+            return "Listening to \(name)"
+        }
+        return "Listening"
+    }
+
+    private var batterySubtitle: String {
+        guard ble.latestVbattValid, let mv = ble.latestVbattMv else { return "---" }
+        return String(format: "%.2fV", Double(mv) / 1000.0)
+    }
+
+    private var lastDataSubtitle: String {
+        guard let received = ble.lastDataReceived else { return "---" }
+        let seconds = max(0, Int(now.timeIntervalSince(received)))
+        if seconds == 1 {
+            return "1s ago"
+        }
+        return "\(seconds)s ago"
+    }
+
     private var motionSubtitle: String {
-        if let v = ble.motionSamples.last?.value, !v.isNaN {
-            return "\(Int(v)) ev/s"
+        if let v = latestFiniteValue(in: ble.motionSamples), !v.isNaN {
+            return "\(Int(v)) interactions"
         }
         return "---"
     }
 
     private var distanceSubtitle: String {
-        guard let last = ble.distanceSamples.last else { return "---" }
-        if last.value.isNaN { return "invalid" }
-        return "\(Int(last.value)) mm"
+        guard let v = latestFiniteValue(in: ble.distanceSamples) else { return "---" }
+        if v.isNaN { return "invalid" }
+        return "\(Int(v)) mm"
+    }
+
+    private func latestFiniteValue(in samples: [Sample]) -> Double? {
+        samples.last(where: { $0.value.isFinite })?.value
     }
 }
 
@@ -110,6 +176,12 @@ private struct TelemetryChart: View {
     let accent: Color
     let samples: [Sample]
     let yLabel: String
+    let now: Date
+
+    private var plottableSamples: [Sample] {
+        let cutoff = now.addingTimeInterval(-BLEManager.plotWindow)
+        return samples.filter { $0.timestamp >= cutoff && $0.value.isFinite }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -124,30 +196,27 @@ private struct TelemetryChart: View {
             }
 
             Chart {
-                ForEach(samples) { s in
-                    LineMark(
-                        x: .value("Sample", s.id),
-                        y: .value(yLabel, s.value)
-                    )
-                    .interpolationMethod(.linear)
-                    .foregroundStyle(accent)
-                    .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
-
+                ForEach(plottableSamples) { s in
                     PointMark(
-                        x: .value("Sample", s.id),
+                        x: .value("Time", s.timestamp),
                         y: .value(yLabel, s.value)
                     )
                     .foregroundStyle(accent)
-                    .symbolSize(28)
+                    .symbolSize(36)
                 }
             }
             .chartXScale(domain: xDomain)
             .chartYScale(domain: yDomain)
             .chartXAxis {
-                AxisMarks(values: .automatic(desiredCount: 5)) { _ in
+                AxisMarks(values: .automatic(desiredCount: 4)) { value in
                     AxisGridLine().foregroundStyle(Color.white.opacity(0.08))
                     AxisTick().foregroundStyle(Color.white.opacity(0.2))
-                    AxisValueLabel().foregroundStyle(Theme.dim)
+                    if let date = value.as(Date.self) {
+                        AxisValueLabel {
+                            Text(date, format: .dateTime.minute().second())
+                                .foregroundStyle(Theme.dim)
+                        }
+                    }
                 }
             }
             .chartYAxis {
@@ -171,16 +240,14 @@ private struct TelemetryChart: View {
         .shadow(color: accent.opacity(0.15), radius: 12, x: 0, y: 6)
     }
 
-    private var xDomain: ClosedRange<Int> {
-        let last = samples.last?.id ?? 0
-        let window = BLEManager.windowSize - 1
-        return last < window ? 0...window : (last - window)...last
+    private var xDomain: ClosedRange<Date> {
+        let end = now
+        let start = end.addingTimeInterval(-BLEManager.plotWindow)
+        return start...end
     }
 
-    /// Pad the y-domain a bit so the line doesn't kiss the axes. Falls back to
-    /// a small range when there are no valid samples yet.
     private var yDomain: ClosedRange<Double> {
-        let finite = samples.compactMap { $0.value.isFinite ? $0.value : nil }
+        let finite = plottableSamples.map(\.value)
         guard let lo = finite.min(), let hi = finite.max() else {
             return 0...1
         }

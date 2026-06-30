@@ -16,7 +16,7 @@ struct ContentView: View {
 
             Group {
                 switch ble.state {
-                case .connected:
+                case .listening:
                     ConnectedView()
                 default:
                     ScanView()
