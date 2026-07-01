@@ -5,10 +5,13 @@
 
 import SwiftUI
 import Charts
+import UIKit
 
 struct ConnectedView: View {
     @EnvironmentObject var ble: BLEManager
     @State private var now = Date()
+    @State private var showShareSheet = false
+    @State private var exportURL: URL?
 
     var body: some View {
         VStack(spacing: 16) {
@@ -19,8 +22,11 @@ struct ConnectedView: View {
                 title: "Motion",
                 subtitle: motionSubtitle,
                 accent: Theme.motion,
-                samples: ble.motionSamples,
+                records: ble.records,
+                flagTimestamps: visibleFlags,
+                chartWindowMinutes: ble.chartWindowMinutes,
                 yLabel: "interactions",
+                valueKeyPath: \.interactions,
                 now: now
             )
 
@@ -28,12 +34,15 @@ struct ConnectedView: View {
                 title: "Distance",
                 subtitle: distanceSubtitle,
                 accent: Theme.distance,
-                samples: ble.distanceSamples,
+                records: ble.records,
+                flagTimestamps: visibleFlags,
+                chartWindowMinutes: ble.chartWindowMinutes,
                 yLabel: "mm",
+                valueKeyPath: \.distanceMm,
                 now: now
             )
 
-            clearButton
+            bottomToolbar
         }
         .padding(.horizontal, 16)
         .padding(.top, 12)
@@ -41,28 +50,61 @@ struct ConnectedView: View {
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { tick in
             now = tick
         }
+        .sheet(isPresented: $showShareSheet) {
+            if let exportURL {
+                ActivityShareSheet(items: [exportURL])
+            }
+        }
     }
 
-    private var clearButton: some View {
-        Button(action: { ble.clearPlots() }) {
-            HStack(spacing: 8) {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 16, weight: .bold))
-                Text("Clear Plots")
-                    .font(.system(size: 16, weight: .heavy, design: .rounded))
+    private var visibleFlags: [Date] {
+        let window = ble.chartWindowMinutes * 60
+        let cutoff = now.addingTimeInterval(-window)
+        return ble.flagTimestamps.filter { $0 >= cutoff }
+    }
+
+    private var bottomToolbar: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(Int(ble.chartWindowMinutes))m")
+                    .font(.system(size: 13, weight: .bold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(Theme.dim)
+                Slider(
+                    value: $ble.chartWindowMinutes,
+                    in: BLEManager.minChartMinutes...BLEManager.maxChartMinutes,
+                    step: 1
+                )
+                .tint(Theme.motion)
+            }
+
+            toolbarButton(title: "Flag", icon: "flag.fill", fill: Color.red.opacity(0.85)) {
+                ble.flagNow()
+            }
+
+            toolbarButton(title: "Clear", icon: "arrow.clockwise", fill: Color.white.opacity(0.12)) {
+                ble.clearPlots()
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func toolbarButton(title: String, icon: String, fill: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .bold))
+                Text(title)
+                    .font(.system(size: 12, weight: .heavy, design: .rounded))
             }
             .foregroundStyle(.white)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(
-                Capsule().fill(Color.white.opacity(0.12))
-            )
+            .frame(width: 64)
+            .padding(.vertical, 10)
+            .background(Capsule().fill(fill))
             .overlay(
-                Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1)
+                Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 4)
     }
 
     private var header: some View {
@@ -79,6 +121,16 @@ struct ConnectedView: View {
                 .minimumScaleFactor(0.8)
 
             Spacer()
+
+            Button(action: shareExport) {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(10)
+                    .background(Capsule().fill(Color.white.opacity(0.12)))
+            }
+            .buttonStyle(.plain)
+            .disabled(ble.records.isEmpty)
 
             Button(action: { ble.leaveListening() }) {
                 HStack(spacing: 6) {
@@ -100,6 +152,12 @@ struct ConnectedView: View {
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 4)
+    }
+
+    private func shareExport() {
+        guard let url = ble.exportFileURL() else { return }
+        exportURL = url
+        showShareSheet = true
     }
 
     private var batteryStrip: some View {
@@ -153,20 +211,23 @@ struct ConnectedView: View {
     }
 
     private var motionSubtitle: String {
-        if let v = latestFiniteValue(in: ble.motionSamples), !v.isNaN {
-            return "\(Int(v)) interactions"
+        if let v = latestInteractions {
+            return "\(v) interactions"
         }
         return "---"
     }
 
     private var distanceSubtitle: String {
-        guard let v = latestFiniteValue(in: ble.distanceSamples) else { return "---" }
-        if v.isNaN { return "invalid" }
-        return "\(Int(v)) mm"
+        guard let v = latestDistanceMm else { return "---" }
+        return "\(v) mm"
     }
 
-    private func latestFiniteValue(in samples: [Sample]) -> Double? {
-        samples.last(where: { $0.value.isFinite })?.value
+    private var latestInteractions: Int? {
+        ble.records.last(where: { $0.interactions != nil })?.interactions
+    }
+
+    private var latestDistanceMm: Int? {
+        ble.records.last(where: { $0.distanceMm != nil })?.distanceMm
     }
 }
 
@@ -174,13 +235,19 @@ private struct TelemetryChart: View {
     let title: String
     let subtitle: String
     let accent: Color
-    let samples: [Sample]
+    let records: [TelemetryRecord]
+    let flagTimestamps: [Date]
+    let chartWindowMinutes: Double
     let yLabel: String
+    let valueKeyPath: KeyPath<TelemetryRecord, Int?>
     let now: Date
 
-    private var plottableSamples: [Sample] {
-        let cutoff = now.addingTimeInterval(-BLEManager.plotWindow)
-        return samples.filter { $0.timestamp >= cutoff && $0.value.isFinite }
+    private var plottableRecords: [(timestamp: Date, value: Double)] {
+        let cutoff = now.addingTimeInterval(-chartWindowMinutes * 60)
+        return records.compactMap { r in
+            guard r.timestamp >= cutoff, let v = r[keyPath: valueKeyPath] else { return nil }
+            return (r.timestamp, Double(v))
+        }
     }
 
     var body: some View {
@@ -196,10 +263,16 @@ private struct TelemetryChart: View {
             }
 
             Chart {
-                ForEach(plottableSamples) { s in
+                ForEach(flagTimestamps, id: \.self) { t in
+                    RuleMark(x: .value("Flag", t))
+                        .foregroundStyle(.red)
+                        .lineStyle(StrokeStyle(lineWidth: 2))
+                }
+
+                ForEach(Array(plottableRecords.enumerated()), id: \.offset) { _, point in
                     PointMark(
-                        x: .value("Time", s.timestamp),
-                        y: .value(yLabel, s.value)
+                        x: .value("Time", point.timestamp),
+                        y: .value(yLabel, point.value)
                     )
                     .foregroundStyle(accent)
                     .symbolSize(36)
@@ -242,13 +315,13 @@ private struct TelemetryChart: View {
 
     private var xDomain: ClosedRange<Date> {
         let end = now
-        let start = end.addingTimeInterval(-BLEManager.plotWindow)
+        let start = end.addingTimeInterval(-chartWindowMinutes * 60)
         return start...end
     }
 
     private var yDomain: ClosedRange<Double> {
-        let finite = plottableSamples.map(\.value)
-        guard let lo = finite.min(), let hi = finite.max() else {
+        let values = plottableRecords.map(\.value)
+        guard let lo = values.min(), let hi = values.max() else {
             return 0...1
         }
         if lo == hi {
@@ -260,6 +333,16 @@ private struct TelemetryChart: View {
         let lower = min(0, lo - pad)
         return lower...(hi + pad)
     }
+}
+
+private struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 #Preview {

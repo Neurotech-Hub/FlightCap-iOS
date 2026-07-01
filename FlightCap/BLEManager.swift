@@ -7,12 +7,12 @@ import Foundation
 import CoreBluetooth
 import Combine
 
-/// One point in a rolling time-series buffer.
-/// `value == .nan` signals an invalid sample (omitted from the chart).
-struct Sample: Identifiable, Equatable {
+struct TelemetryRecord: Identifiable, Equatable {
     let id = UUID()
     let timestamp: Date
-    let value: Double
+    let interactions: Int?
+    let distanceMm: Int?
+    let userFlag: Bool
 }
 
 enum AppState: Equatable {
@@ -33,8 +33,10 @@ struct DiscoveredCap: Identifiable, Equatable {
 @MainActor
 final class BLEManager: NSObject, ObservableObject {
 
-    /// Rolling plot window — only samples within the last 5 minutes are kept.
-    static let plotWindow: TimeInterval = 5 * 60
+    static let maxBufferMinutes: Double = 60
+    static let defaultChartMinutes: Double = 10
+    static let minChartMinutes: Double = 5
+    static let maxChartMinutes: Double = 60
     static let scanTimeout: TimeInterval = 60
 
     private static let scanOptions: [String: Any] = [
@@ -46,8 +48,8 @@ final class BLEManager: NSObject, ObservableObject {
     @Published private(set) var state: AppState = .idle
     @Published private(set) var discoveredCaps: [DiscoveredCap] = []
     @Published private(set) var selectedCap: DiscoveredCap?
-    @Published private(set) var motionSamples: [Sample] = []
-    @Published private(set) var distanceSamples: [Sample] = []
+    @Published private(set) var records: [TelemetryRecord] = []
+    @Published var chartWindowMinutes: Double = defaultChartMinutes
     @Published private(set) var latestVbattMv: UInt16?
     @Published private(set) var latestVbattValid = false
     @Published private(set) var lastDataReceived: Date?
@@ -117,11 +119,34 @@ final class BLEManager: NSObject, ObservableObject {
         resetBuffers()
     }
 
+    func flagNow() {
+        appendRecord(TelemetryRecord(
+            timestamp: Date(),
+            interactions: nil,
+            distanceMm: nil,
+            userFlag: true
+        ))
+    }
+
+    func exportCSV() -> String {
+        TelemetryExport.csvString(from: records)
+    }
+
+    func exportFileURL() -> URL? {
+        let name = selectedCap.map { cap in
+            "FlightCap_\(cap.displayName.replacingOccurrences(of: ":", with: "-"))"
+        } ?? "FlightCap"
+        return TelemetryExport.writeTempCSV(exportCSV(), baseName: name)
+    }
+
+    var flagTimestamps: [Date] {
+        records.filter(\.userFlag).map(\.timestamp)
+    }
+
     // MARK: - Helpers
 
     private func resetBuffers() {
-        motionSamples.removeAll(keepingCapacity: true)
-        distanceSamples.removeAll(keepingCapacity: true)
+        records.removeAll(keepingCapacity: true)
         lastRecordedSeq = nil
         latestVbattMv = nil
         latestVbattValid = false
@@ -173,50 +198,43 @@ final class BLEManager: NSObject, ObservableObject {
         guard telemetry.deviceAddr.elementsEqual(selected.id) else { return }
 
         lastDataReceived = Date()
-        pruneAllSamples()
+        pruneRecords()
 
         if let lastSeq = lastRecordedSeq, lastSeq == telemetry.seq { return }
         lastRecordedSeq = telemetry.seq
 
-        let motionValue: Double = telemetry.isInteractValid
-            ? Double(telemetry.interactions)
-            : .nan
-        let distanceValue: Double = telemetry.isDistValid
-            ? Double(telemetry.distanceMm)
-            : .nan
+        let interactions: Int? = telemetry.isInteractValid
+            ? Int(telemetry.interactions)
+            : nil
+        let distanceMm: Int? = telemetry.isDistValid
+            ? Int(telemetry.distanceMm)
+            : nil
 
-        let recordedAt = Date()
-        appendMotion(motionValue, at: recordedAt)
-        appendDistance(distanceValue, at: recordedAt)
+        appendRecord(TelemetryRecord(
+            timestamp: Date(),
+            interactions: interactions,
+            distanceMm: distanceMm,
+            userFlag: false
+        ))
 
         latestVbattValid = telemetry.isVbattValid
         latestVbattMv = telemetry.isVbattValid ? telemetry.vbattMv : nil
     }
 
-    private func appendMotion(_ value: Double, at timestamp: Date) {
-        motionSamples.append(Sample(timestamp: timestamp, value: value))
-        pruneSamples(&motionSamples)
+    private func appendRecord(_ record: TelemetryRecord) {
+        records.append(record)
+        pruneRecords()
     }
 
-    private func appendDistance(_ value: Double, at timestamp: Date) {
-        distanceSamples.append(Sample(timestamp: timestamp, value: value))
-        pruneSamples(&distanceSamples)
-    }
-
-    private func pruneSamples(_ samples: inout [Sample]) {
-        let cutoff = Date().addingTimeInterval(-Self.plotWindow)
-        if let firstKeep = samples.firstIndex(where: { $0.timestamp >= cutoff }) {
+    private func pruneRecords() {
+        let cutoff = Date().addingTimeInterval(-Self.maxBufferMinutes * 60)
+        if let firstKeep = records.firstIndex(where: { $0.timestamp >= cutoff }) {
             if firstKeep > 0 {
-                samples.removeFirst(firstKeep)
+                records.removeFirst(firstKeep)
             }
-        } else {
-            samples.removeAll(keepingCapacity: true)
+        } else if !records.isEmpty {
+            records.removeAll(keepingCapacity: true)
         }
-    }
-
-    private func pruneAllSamples() {
-        pruneSamples(&motionSamples)
-        pruneSamples(&distanceSamples)
     }
 
     private func bluetoothStateMessage(for state: CBManagerState) -> String? {
